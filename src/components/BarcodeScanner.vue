@@ -7,6 +7,8 @@
       ref="videoRef" 
       class="mx-auto rounded-lg shadow-md w-full max-w-sm bg-black" 
       autoplay
+      muted
+      playsinline
     ></video>
 
     <!-- Resultado -->
@@ -63,25 +65,24 @@ import { BrowserMultiFormatReader } from '@zxing/browser'
 import { productApi } from '@/services/api'
 import type { Product } from '@/types'
 
-// Props y emits
 const emit = defineEmits<{
   productFound: [product: Product]
   productNotFound: [barcode: string]
 }>()
 
-// Referencias
 const videoRef = ref<HTMLVideoElement | null>(null)
 const scannedCode = ref<string | null>(null)
 const isScanning = ref(false)
 const isLoading = ref(false)
 const error = ref<string | null>(null)
-let codeReader: BrowserMultiFormatReader | null = null
-let scanningControls: any = null
 
-// Inicia la cámara y el lector
+let codeReader: BrowserMultiFormatReader | null = null
+let stream: MediaStream | null = null
+
+// Inicia el escáner
 const startScanner = async () => {
   if (!videoRef.value) {
-    error.value = 'No se pudo acceder al elemento de video'
+    error.value = 'No se pudo acceder al video'
     return
   }
 
@@ -91,141 +92,94 @@ const startScanner = async () => {
   isScanning.value = true
 
   codeReader = new BrowserMultiFormatReader()
-  console.log('🎥 Iniciando escáner de códigos de barras...')
-  
   try {
-    // Configurar constraints optimizados para móviles
-    const constraints = {
-      video: {
-        facingMode: { ideal: 'environment' }, // Cámara trasera en móviles
-        width: { min: 640, ideal: 1280, max: 1920 },
-        height: { min: 480, ideal: 720, max: 1080 },
-        aspectRatio: { ideal: 16/9 }
-      }
-    }
-    
-    console.log('📱 Configurando cámara para móvil...')
-    
-    // Obtener dispositivos de video disponibles
     const devices = await navigator.mediaDevices.enumerateDevices()
     const videoDevices = devices.filter(d => d.kind === 'videoinput')
-    console.log('📹 Cámaras disponibles:', videoDevices.length)
-    
-    // En móvil, buscar específicamente la cámara trasera
-    let selectedDeviceId: string | undefined
-    const backCamera = videoDevices.find(device => 
-      device.label.toLowerCase().includes('back') || 
-      device.label.toLowerCase().includes('rear') ||
-      device.label.toLowerCase().includes('trasera') ||
-      device.label.toLowerCase().includes('environment')
+
+    // Elegir cámara trasera si existe
+    const backCamera = videoDevices.find(d => 
+      d.label.toLowerCase().includes('back') ||
+      d.label.toLowerCase().includes('rear') ||
+      d.label.toLowerCase().includes('trasera') ||
+      d.label.toLowerCase().includes('environment')
     )
-    
-    if (backCamera) {
-      selectedDeviceId = backCamera.deviceId
-      console.log('📱 Usando cámara trasera:', backCamera.label)
-    } else {
-      console.log('📷 Usando cámara predeterminada')
-    }
-    
-    // Configurar el stream de video
-    const finalConstraints = selectedDeviceId 
-      ? { ...constraints, video: { ...constraints.video, deviceId: { exact: selectedDeviceId } } }
-      : constraints
-    
-    const stream = await navigator.mediaDevices.getUserMedia(finalConstraints)
-    if (videoRef.value) {
-      videoRef.value.srcObject = stream
-      await videoRef.value.play()
-    }
-    
-    console.log('✅ Stream de video iniciado')
-    
-    // Esperar a que la cámara se estabilice (importante en móviles)
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    
-    scanningControls = await codeReader.decodeFromVideoDevice(selectedDeviceId, videoRef.value, async (result) => {
-      if (result) {
-        const barcode = result.getText()
-        const format = result.getBarcodeFormat()
-        console.log('✅ Código detectado:', barcode, 'Formato:', format)
-        scannedCode.value = barcode
-        
-        // Vibración en móviles al detectar código
-        if ('vibrate' in navigator) {
-          navigator.vibrate(200)
-        }
-        
-        // Buscar producto en el backend
-        await searchProduct(barcode)
-      }
-      // Ignoramos completamente los errores de escaneo (NotFoundException es normal)
+    const deviceId = backCamera?.deviceId || videoDevices[0]?.deviceId
+    if (!deviceId) throw new Error('No se encontró cámara disponible')
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: deviceId } }
     })
-    
-    console.log('✅ Escáner iniciado correctamente')
-  } catch (err) {
-    console.error('❌ Error iniciando cámara:', err)
-    error.value = '❌ Error al acceder a la cámara. Verifica los permisos.'
+
+    videoRef.value.srcObject = stream
+    await videoRef.value.play()
+
+    // Escaneo continuo usando decodeOnce, luego reiniciamos
+    scanLoop(deviceId)
+  } catch (err: any) {
+    console.error(err)
+    error.value = '❌ No se pudo iniciar la cámara. Verifica los permisos.'
     isScanning.value = false
   }
 }
 
-// Busca el producto por código de barras
+// Escaneo en loop para detectar múltiples códigos
+const scanLoop = async (deviceId: string) => {
+  if (!codeReader || !videoRef.value || !isScanning.value) return
+  try {
+    const result = await codeReader.decodeOnceFromVideoDevice(deviceId, videoRef.value)
+    if (result) {
+      const barcode = result.getText()
+      scannedCode.value = barcode
+      if ('vibrate' in navigator) navigator.vibrate(200)
+      await searchProduct(barcode)
+    }
+  } catch (err) {
+    // NotFoundException se ignora
+  }
+  // Llamamos nuevamente para continuar escaneando
+  if (isScanning.value) scanLoop(deviceId)
+}
+
+// Buscar producto en backend
 const searchProduct = async (barcode: string) => {
   isLoading.value = true
   error.value = null
-  
   try {
-    console.log('Buscando producto por código de barras:', barcode)
     const product = await productApi.searchByBarcode(barcode)
-    
-    if (product) {
-      emit('productFound', product)
-      // Opcional: detener el escáner después de encontrar un producto
-      // stopScanner()
-    } else {
-      error.value = `Producto con código ${barcode} no encontrado`
+    if (product) emit('productFound', product)
+    else {
       emit('productNotFound', barcode)
+      error.value = `Producto con código ${barcode} no encontrado`
     }
   } catch (err) {
-    console.error('Error buscando producto:', err)
+    console.error(err)
     error.value = 'Error al buscar el producto'
   } finally {
     isLoading.value = false
   }
 }
 
-// Detiene la cámara y libera recursos
+// Detener escáner y liberar recursos
 const stopScanner = () => {
-  if (scanningControls) {
-    scanningControls.stop()
-    scanningControls = null
-  }
-  if (codeReader) {
-    codeReader = null
-  }
-  // Detener el stream de video
-  if (videoRef.value && videoRef.value.srcObject) {
-    const stream = videoRef.value.srcObject as MediaStream
-    stream.getTracks().forEach(track => track.stop())
-    videoRef.value.srcObject = null
-  }
   isScanning.value = false
   scannedCode.value = null
   error.value = null
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop())
+    stream = null
+  }
+  if (videoRef.value) videoRef.value.srcObject = null
+  codeReader = null
 }
 
-// Función de prueba para simular detección
+// Función de prueba
 const testBarcode = async () => {
-  const testCode = '7501052475011' // El código de tu producto
-  console.log('🧪 Probando con código de ejemplo:', testCode)
+  const testCode = '7501052475011'
   scannedCode.value = testCode
   await searchProduct(testCode)
 }
 
-// Limpieza al desmontar el componente
-onUnmounted(() => {
-  stopScanner()
-})
+onUnmounted(() => stopScanner())
 </script>
 
 <style scoped>
@@ -235,12 +189,8 @@ video {
 }
 
 @keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.8;
-  }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
 }
 
 .animate-pulse {
